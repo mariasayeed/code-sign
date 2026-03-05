@@ -1,0 +1,13 @@
+{
+  "_comment": "HSM PKCS#11 bridge configuration. Copy to hsm_pkcs11_config.json and fill in values.",
+  "hsm_base":           "https://192.168.1.159:7008/crypto/api/v1",
+  "auth_token":         "YOUR_JWT_BEARER_TOKEN",
+  "tls_verify":         false,
+  "csf_key_id":         "REPLACE_WITH_CSF_PUBLICKEY_ID_FROM_PKI_API",
+  "img_key_id":         "REPLACE_WITH_IMG_PUBLICKEY_ID_FROM_PKI_API",
+  "token_label":        "HSM-CST",
+  "token_pin":          "changeme",
+  "srk_cert_path":      "/absolute/path/to/certs/SRK1.pem",
+  "csf_cert_path":      "/absolute/path/to/certs/CSF.pem",
+  "img_cert_path":      "/absolute/path/to/certs/IMG.pem"
+}
