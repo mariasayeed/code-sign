@@ -448,13 +448,20 @@ static int _hsm_sign(const char *key_id,
     snprintf(path, sizeof(path), "/context/%s/ds/creator/data/base64", ctx_id);
     if (_get(path, &resp) != 0) return -1;
 
-    /* Strip whitespace from base64 response */
+    /* Response body is JSON: {"Base64Data":"MIIB..."}
+     * Extract the value of "Base64Data" first, then base64-decode it.
+     * Fall back to treating the whole body as a raw base64 string if the
+     * key is not found (defensive, in case the API returns plain text). */
     char b64[HSM_MAX_SIG_BYTES * 2];
-    size_t b64_out = 0;
-    for (size_t i = 0; resp[i]; i++)
-        if (resp[i] != ' ' && resp[i] != '\n' && resp[i] != '\r' && resp[i] != '\t')
-            b64[b64_out++] = resp[i];
-    b64[b64_out] = '\0';
+    if (_json_get_str(resp, "Base64Data", b64, sizeof(b64)) != 0) {
+        /* Key not found — fall back: strip whitespace from raw body */
+        fprintf(stderr, "[HSM-PKCS11] 'Base64Data' not in response, using raw body\n");
+        size_t b64_out = 0;
+        for (size_t i = 0; resp[i] && b64_out + 1 < sizeof(b64); i++)
+            if (resp[i] != ' ' && resp[i] != '\n' && resp[i] != '\r' && resp[i] != '\t')
+                b64[b64_out++] = resp[i];
+        b64[b64_out] = '\0';
+    }
     free(resp);
 
     size_t n = _b64_decode(b64, sig_out, *sig_len_out);
