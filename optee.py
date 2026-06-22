@@ -1,5 +1,131 @@
 #!/usr/bin/env python3
 """
+optee_sign_standalone.py
+========================
+
+Standalone OP-TEE Trusted Application signing script.
+
+This script signs an unsigned OP-TEE TA ELF and produces a deployable
+OP-TEE `.ta` file using the internal PKI + HSM REST APIs.
+
+It is intentionally separate from the HAB/CST signing flow.
+
+What this script does
+---------------------
+1. Accepts an unsigned OP-TEE Trusted Application ELF.
+2. Selects the OP-TEE TA signing key based on product code.
+3. Reuses an existing OPTEE_TA keypair from a JSON key map if present.
+4. Optionally creates a new product-specific OPTEE_TA keypair if the product
+   does not exist in the key map.
+5. Sends the TA payload to the internal HSM signing API.
+6. Builds the final signed OP-TEE `.ta` file.
+7. Writes checksum and manifest artifacts for engineers.
+
+What this script does NOT do
+----------------------------
+- It does not run CST.
+- It does not run srktool.
+- It does not generate SRK tables or SRK fuse hashes.
+- It does not create or use HAB CSF/IMG signatures.
+- It does not export private keys.
+- It does not write private key material locally.
+- It does not embed certificates inside the `.ta` file.
+
+Expected input
+--------------
+The input should normally be an unsigned OP-TEE TA ELF file produced by the
+OP-TEE TA build process.
+
+Example input:
+
+    app.elf
+
+or:
+
+    8aaaf200-2450-11e4-abe2-0002a5d5c51b.elf
+
+Expected output
+---------------
+The script writes artifacts under:
+
+    remote-optee/results/<product-code>/
+
+Example:
+
+    remote-optee/results/product-a/
+      8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta
+      8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta.sha256
+      optee_signing_manifest.json
+
+Engineers should consume the `.ta` file and place it on the target filesystem:
+
+    /lib/optee_armtz/<uuid>.ta
+
+Example:
+
+    /lib/optee_armtz/8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta
+
+Key map behavior
+----------------
+The key map controls product-code-to-signing-key reuse.
+
+Example key map:
+
+    {
+      "version": 1,
+      "products": {
+        "product-a": {
+          "product_code": "product-a",
+          "pki_id": "pki-123",
+          "optee_ta_key_id": "key-abc",
+          "algorithm": "RSA_4096",
+          "signature_algorithm": "SHA256WITHRSA",
+          "created_at": "2026-06-21T00:00:00Z"
+        }
+      }
+    }
+
+If product-a exists in the key map, the script reuses key-abc.
+
+If product-a does not exist:
+- default behavior: create a new PKI + OPTEE_TA keypair and update the key map
+- with --no-create-key: fail immediately
+
+Recommended production behavior
+-------------------------------
+Use --no-create-key in production.
+
+This prevents accidental creation of a new signing key if someone mistypes the
+product code.
+
+Example production run:
+
+    python3 optee_signing/optee_sign_standalone.py app.elf \\
+      --uuid 8aaaf200-2450-11e4-abe2-0002a5d5c51b \\
+      --product-code product-a \\
+      --key-map optee_key_map.json \\
+      --no-create-key \\
+      --pki-base "$PKI_BASE" \\
+      --pki-token "$PKI_TOKEN" \\
+      --hsm-base "$HSM_BASE" \\
+      --hsm-token "$HSM_TOKEN" \\
+      --out-dir remote-optee/results
+
+Example development/bootstrap run
+---------------------------------
+This allows the script to create a new keypair if the product does not yet exist
+in the key map:
+
+    python3 optee_signing/optee_sign_standalone.py app.elf \\
+      --uuid 8aaaf200-2450-11e4-abe2-0002a5d5c51b \\
+      --product-code product-a \\
+      --key-map optee_key_map.json \\
+      --pki-base "$PKI_BASE" \\
+      --pki-token "$PKI_TOKEN" \\
+      --hsm-base "$HSM_BASE" \\
+      --hsm-token "$HSM_TOKEN" \\
+      --out-dir remote-optee/results
+
 Standalone OP-TEE TA signing script using internal PKI + HSM REST APIs.
 
 Input:
