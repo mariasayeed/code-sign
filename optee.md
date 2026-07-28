@@ -1,97 +1,101 @@
-# OP-TEE + Internal PKI/HSM Investigation Summary
+# OP-TEE + Internal PKI/HSM Signing Audit
 
-## Goal
+## Conclusion
 
-Build a production-quality OP-TEE Trusted Application signing tool that:
+`optee_new.py` originally did not produce the current OP-TEE bootstrap TA
+format. The implementation has been corrected to match the official
+`optee_os/scripts/sign_encrypt.py` behavior for RSA PKCS#1 v1.5 with SHA-256.
 
-- Uses internal PKI REST APIs
-- Uses internal HSM REST APIs
-- Never exports private keys
-- Supports per-product signing keys
-- Stores key mappings in `optee_key_map.json`
-- Produces valid OP-TEE `.ta` files
-- Supports both possible HSM signing semantics until validated
+The required digest is:
 
----
-
-## Current Script
-
-The current implementation:
-
-```python
-signature = hsm_sign(
-    ...
-    data_to_sign=unsigned_elf
+```text
+SHA256(
+    shdr +
+    ta_uuid +
+    little_endian_uint32(ta_version) +
+    stripped_elf
 )
 ```
 
-Computes:
-
-```python
-digest = SHA256(ELF)
-```
-
-And generates:
+The required output layout is:
 
 ```text
 shdr
 digest
 signature
-elf
-```
-
----
-
-## Legacy OP-TEE Signer Reference
-
-Found legacy OP-TEE signer code that computes:
-
-```python
-h.update(shdr)
-h.update(shdr_uuid)
-h.update(shdr_version)
-h.update(img)
-
-img_digest = h.finalize()
-```
-
-And then signs:
-
-```python
-img_digest
-```
-
-using:
-
-```python
-utils.Prehashed(SHA256)
-```
-
-The generated TA layout is:
-
-```text
-shdr
-digest
-signature
-uuid
+ta_uuid
 ta_version
-image
+stripped_elf
 ```
 
-Not:
+The UUID identifies the TA and normally also names the installed file:
 
 ```text
-shdr
-digest
-signature
-image
+/lib/optee_armtz/<uuid>.ta
 ```
 
----
+It is not a certificate, key, or PKI object ID.
 
-## Official OP-TEE References Found
+## Legacy Screenshot Review
 
-Official OP-TEE signed header:
+The four screenshots in `optee_legacy/` appear to show an older fork of the
+OP-TEE/Linaro signing script with support for a private key held in KMS. The
+visible implementation is technically consistent with the official bootstrap
+TA format:
+
+- `SHDR_MAGIC` is `0x4F545348`.
+- `SHDR_BOOTSTRAP_TA` is `1`.
+- The signed header uses `struct.pack("<IIIIHH", ...)`.
+- The UUID uses `args.uuid.bytes`.
+- The TA version uses little-endian `struct.pack("<I", ta_version)`.
+- The digest update order is header, UUID, version, then image.
+- Signing uses `utils.Prehashed(SHA256)`.
+- The output order is header, digest, signature, UUID, version, then image.
+- Both RSA-PSS and RSA PKCS#1 v1.5 SHA-256 identifiers are present.
+- Offline `digest`, `stitch`, and `verify` operations are present.
+
+The encrypted-TA branch visible in the screenshots also follows the expected
+high-level layout: AES-GCM ciphertext, a 12-byte nonce, a 16-byte tag, and the
+encrypted subheader included in the digest.
+
+Based on the visible code, the old signer could have produced a valid TA. The
+screenshots cannot establish that it ever did so in the deployed environment.
+Successful loading would still have depended on:
+
+- the matching public key being embedded in the target OP-TEE OS
+- the correct stripped ELF and TA UUID
+- the same TA version being used during digest and stitch operations
+- KMS returning the requested RSA padding/signature semantics
+- correct PSS salt/MGF settings when RSA-PSS was selected
+- complete, untampered source beyond the photographed portions
+
+One useful distinction is that the old private-key/KMS abstraction signs an
+already-computed digest with `Prehashed(SHA256)`. The current REST API declares
+`SHA256WITHRSA`, which ordinarily hashes uploaded bytes itself. This is why the
+current default uploads the complete OP-TEE digest preimage instead of uploading
+the digest or raw ELF.
+
+## Confirmed Corrections
+
+The official values and format are:
+
+```python
+SHDR_MAGIC = 0x4F545348
+SHDR_BOOTSTRAP_TA = 1
+TEE_ALG_RSASSA_PKCS1_V1_5_SHA256 = 0x70004830
+```
+
+The previous values were wrong:
+
+```python
+SHDR_MAGIC = 0x52444853
+SHDR_TA = 0
+```
+
+The previous digest `SHA256(ELF)` was also wrong for a bootstrap TA because it
+did not cover the signed header, UUID, or TA version.
+
+The official signed header is:
 
 ```c
 struct shdr {
@@ -104,301 +108,175 @@ struct shdr {
 };
 ```
 
-Layout:
-
-```text
-shdr
-hash
-signature
-payload
-```
-
-Documentation and sources indicate OP-TEE signing is handled by:
-
-```text
-optee_os/scripts/sign_encrypt.py
-```
-
-and
-
-```text
-core/include/signed_hdr.h
-```
-
----
-
-## Confirmed Bug
-
-Current script:
-
-```python
-SHDR_MAGIC = 0x52444853
-```
-
-Legacy OP-TEE:
-
-```python
-SHDR_MAGIC = 0x4F545348
-```
-
-Official OP-TEE:
+The bootstrap subheader is:
 
 ```c
-#define SHDR_MAGIC 0x4f545348
+struct shdr_bootstrap_ta {
+    uint8_t uuid[sizeof(TEE_UUID)];
+    uint32_t ta_version;
+};
 ```
 
-This is highly likely a bug and should be corrected.
+`img_size` is the ELF/image length. It does not include the UUID and version
+subheader.
 
----
+## HSM Signing Semantics
 
-## UUID Understanding
-
-UUID is:
-
-```text
-Trusted Application identifier
-```
-
-Example:
-
-```text
-8aaaf200-2450-11e4-abe2-0002a5d5c51b
-```
-
-Used by OP-TEE for:
-
-```text
-/lib/optee_armtz/<uuid>.ta
-```
-
-The UUID is NOT:
-
-- certificate ID
-- key ID
-- PKI object ID
-
-The UUID identifies the TA itself.
-
----
-
-## Important Unknown
-
-Internal HSM API supports:
+The REST request uses:
 
 ```json
 {
+  "publicKeyId": "<key-id>",
   "signatureParameters": "SHA256WITHRSA",
   "signatureFormat": "RAW"
 }
 ```
 
-Question:
-
-Does HSM perform:
-
-```text
-RSA_SIGN(SHA256(uploaded_data))
-```
-
-or:
+The normal interpretation of `SHA256WITHRSA` is that the service hashes the
+uploaded message and then applies RSA PKCS#1 v1.5 signing. Therefore the
+default `--sign-mode hsm-message` uploads:
 
 ```text
-RSA_SIGN(uploaded_digest)
+shdr + ta_uuid + ta_version + stripped_elf
 ```
 
-This was not proven.
+This produces a signature over the same SHA-256 digest stored in the TA.
 
----
+`--sign-mode optee-digest` remains available only for an internal service that
+has been independently confirmed to treat the uploaded 32-byte value as a
+prehashed SHA-256 digest despite the `SHA256WITHRSA` parameter. With an API
+that hashes its input, that mode would sign `SHA256(optee_digest)` and the TA
+would fail verification.
 
-## Two Possible Signing Models
+Uploading only the raw ELF is not a valid alternative: its signature omits
+the OP-TEE header, UUID, and version.
 
-### Model A
+## Preserved Internal REST Paths
 
-Upload:
+PKI creation:
 
-```text
-ELF
+```http
+POST /pki
 ```
 
-to HSM.
+Application keypair creation:
 
-HSM performs:
-
-```text
-SHA256(ELF)
-RSA Sign
+```http
+POST /pki/{pki_id}/keypair
 ```
 
-Current script is closer to this.
+Public signing-certificate export:
 
-### Model B
-
-Generate OP-TEE digest:
-
-```text
-SHA256(
-    shdr +
-    uuid +
-    version +
-    image
-)
+```http
+GET /keypair/{keypair_id}/certificate/textual
 ```
 
-Upload digest.
-
-HSM signs digest.
-
-Legacy OP-TEE script is closer to this.
-
----
-
-## Recommendation
-
-Support both modes.
-
-CLI:
-
-```bash
---sign-mode optee-digest
-```
-
-and
-
-```bash
---sign-mode raw-image
-```
-
----
-
-## Production Features To Preserve
-
-Keep from original implementation:
-
-- PKI creation
-- Keypair creation
-- Product mapping via `optee_key_map.json`
-- Reuse logic via `--no-create-key`
-
----
-
-## HSM APIs Confirmed
-
-Create context:
+HSM context creation:
 
 ```http
 POST /context
 ```
 
-Upload bytes:
+HSM data upload:
 
 ```http
 POST /context/{id}/data
 ```
 
-Sign:
+Signature creation:
 
 ```http
 POST /context/{id}/ds/creator
 ```
 
-Download signature:
+Signature download:
 
 ```http
 GET /context/{id}/ds/creator/data/base64
 ```
 
-Cleanup:
+Context cleanup:
 
 ```http
 DELETE /context/{id}
 ```
 
----
+No existing PKI or HSM endpoint was renamed or removed.
 
-## New CLI Options Needed
+## Preserved Product-Key Behavior
 
-```python
---ta-version
-```
+- PKI creation is retained.
+- Application keypair creation is retained.
+- Product mappings remain in `optee_key_map.json`.
+- Existing mappings are reused.
+- `--no-create-key` still prevents accidental key creation.
+- Private keys are never exported.
 
-Default:
+The RSA signature size is inferred from the mapped algorithm, for example
+`RSA_4096` produces a 512-byte signature. `--signature-size` can override this
+when an older key-map entry does not describe the key size.
 
-```python
-0
-```
+## CLI and Transport Controls
 
-and:
-
-```python
---sign-mode
-```
-
-Choices:
+The corrected implementation provides:
 
 ```text
-optee-digest
-raw-image
+--ta-version <uint32>
+--sign-mode hsm-message|optee-digest
+--signature-size <bytes>
+--ca-bundle <path>
+--insecure
 ```
 
----
+TLS verification is enabled by default. `--ca-bundle` supports an internal CA.
+`--insecure` is an explicit compatibility escape hatch.
 
-## Manifest Improvements
+All REST operations have timeouts. HSM contexts are deleted in a `finally`
+block, including when signing or decoding fails.
 
-Add:
+## Output Validation and Manifest
 
-```json
-{
-  "ta_version": 0,
-  "signature_size": 512,
-  "signature_sha256": "...",
-  "sign_mode": "optee-digest"
-}
+Before writing a `.ta`, the script re-parses the generated bytes and checks:
+
+- signed-header magic
+- bootstrap image type
+- signature algorithm
+- hash and signature sizes
+- total package size
+- UUID and TA version placement
+- embedded digest against the complete OP-TEE digest preimage
+
+The manifest records the TA version, embedded digest, actual signature size,
+signature SHA-256, selected HSM input mode, public-certificate path, and
+public-certificate SHA-256.
+
+Each signing run also writes:
+
+```text
+optee_ta_public_certificate.pem
 ```
 
----
-
-## Validation Steps
-
-### Test 1
-
-Generate:
+beside the `.ta` output. To generate the standalone public-key PEM required by
+an OP-TEE OS build:
 
 ```bash
---sign-mode optee-digest
+openssl x509 -in optee_ta_public_certificate.pem -pubkey -noout \
+  > optee_ta_public_key.pem
 ```
 
-Attempt TA load.
-
-### Test 2
-
-Generate:
+Use the resulting key when building OP-TEE OS:
 
 ```bash
---sign-mode raw-image
+make TA_PUBLIC_KEY=/path/to/optee_ta_public_key.pem
 ```
 
-Attempt TA load.
+Cryptographic signature verification still requires the public key embedded
+in the matching OP-TEE OS build. The final integration test is to load the TA
+on that target, or verify/stitch it with the matching official OP-TEE tooling
+and public key.
 
-### Test 3
+## Official References
 
-Compare against official OP-TEE output if available.
-
----
-
-## Final Desired Script Characteristics
-
-- full original PKI integration
-- full original HSM integration
-- key-map JSON support
-- per-product key reuse
-- HSM context cleanup
-- corrected magic value
-- TA version support
-- dual signing modes
-- detailed manifest
-- TLS CA option instead of hardcoded `verify=False`
-- request timeouts
-- logging
-- robust error handling
-- no private key export
-- OP-TEE-compatible TA packaging investigation path
+- [OP-TEE `scripts/sign_encrypt.py`](https://github.com/OP-TEE/optee_os/blob/master/scripts/sign_encrypt.py)
+- [OP-TEE `core/include/signed_hdr.h`](https://github.com/OP-TEE/optee_os/blob/master/core/include/signed_hdr.h)
+- [OP-TEE documentation: Offline Signing of TAs](https://optee.readthedocs.io/en/latest/building/trusted_applications.html#offline-signing-of-tas)

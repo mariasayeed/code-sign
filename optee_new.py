@@ -31,6 +31,7 @@ Env vars match HAB script:
 Output:
   remote-optee/results/<product-code>/<uuid>.ta
   remote-optee/results/<product-code>/<uuid>.ta.sha256
+  remote-optee/results/<product-code>/optee_ta_public_certificate.pem
   remote-optee/results/<product-code>/optee_signing_manifest.json
 
 Notes:
@@ -43,19 +44,20 @@ Notes:
 
 import argparse
 import base64
+import binascii
 import hashlib
 import json
 import os
 import re
 import struct
 import sys
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Union
 
 try:
     import requests
-    requests.packages.urllib3.disable_warnings()
 except ImportError:
     sys.exit("pip install requests")
 
@@ -63,11 +65,17 @@ except ImportError:
 DEFAULT_APP_KEY_ALG = "RSA_4096"
 DEFAULT_SIG_ALG = "SHA256WITHRSA"
 
-# OP-TEE signed TA header values
-SHDR_MAGIC = 0x52444853  # "SHDR"
-SHDR_TA = 0
+# OP-TEE signed bootstrap TA header values. These match
+# optee_os/core/include/signed_hdr.h and scripts/sign_encrypt.py.
+SHDR_MAGIC = 0x4F545348
+SHDR_BOOTSTRAP_TA = 1
 TEE_ALG_RSASSA_PKCS1_V1_5_SHA256 = 0x70004830
 HASH_SIZE = 32
+SHDR_SIZE = struct.calcsize("<IIIIHH")
+BOOTSTRAP_HEADER_SIZE = 16 + struct.calcsize("<I")
+
+DEFAULT_TIMEOUT = 60
+DATA_TIMEOUT = 120
 
 
 def log(msg: str, level: str = "INFO") -> None:
@@ -75,7 +83,12 @@ def log(msg: str, level: str = "INFO") -> None:
 
 
 def now_utc() -> str:
-    return datetime.utcnow().isoformat()
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def validate_uuid(value: str) -> str:
@@ -106,7 +119,12 @@ def _pki_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
-def create_pki(pki_base: str, token: str, product_code: str) -> dict:
+def create_pki(
+    pki_base: str,
+    token: str,
+    product_code: str,
+    tls_verify: Union[bool, str],
+) -> dict:
     """
     POST {pki_base}/pki
     Returns JSON with 'pkid' or 'id'.
@@ -124,7 +142,8 @@ def create_pki(pki_base: str, token: str, product_code: str) -> dict:
         f"{pki_base}/pki",
         json=body,
         headers=_pki_headers(token),
-        verify=False,
+        verify=tls_verify,
+        timeout=DEFAULT_TIMEOUT,
     )
     r.raise_for_status()
 
@@ -141,6 +160,7 @@ def create_application_keypair(
     token: str,
     pki_id: str,
     label: str,
+    tls_verify: Union[bool, str],
 ) -> dict:
     """
     POST {pki_base}/pki/{pki_id}/keypair
@@ -162,7 +182,8 @@ def create_application_keypair(
         f"{pki_base}/pki/{pki_id}/keypair",
         json=body,
         headers=_pki_headers(token),
-        verify=False,
+        verify=tls_verify,
+        timeout=DEFAULT_TIMEOUT,
     )
     r.raise_for_status()
 
@@ -174,6 +195,35 @@ def create_application_keypair(
         )
 
     return {"keypair_id": kp_id, "raw": resp}
+
+
+def export_certificate(
+    pki_base: str,
+    token: str,
+    keypair_id: str,
+    tls_verify: Union[bool, str],
+) -> str:
+    """
+    GET {pki_base}/keypair/{keypair_id}/certificate/textual
+    Returns the public certificate as plain PEM text.
+    """
+    r = requests.get(
+        f"{pki_base}/keypair/{keypair_id}/certificate/textual",
+        headers=_pki_headers(token),
+        verify=tls_verify,
+        timeout=DEFAULT_TIMEOUT,
+    )
+    r.raise_for_status()
+
+    certificate_pem = r.text.strip()
+    if (
+        "-----BEGIN CERTIFICATE-----" not in certificate_pem
+        or "-----END CERTIFICATE-----" not in certificate_pem
+    ):
+        raise RuntimeError(
+            f"Certificate export for keypair {keypair_id} did not return PEM"
+        )
+    return certificate_pem + "\n"
 
 
 # ── Product key map ────────────────────────────────────────────────────────────
@@ -204,6 +254,7 @@ def setup_or_reuse_optee_key(
     product_code: str,
     key_map_path: Path,
     create_if_missing: bool,
+    tls_verify: Union[bool, str],
 ) -> dict:
     key_map = load_key_map(key_map_path)
     products = key_map.setdefault("products", {})
@@ -229,7 +280,7 @@ def setup_or_reuse_optee_key(
     log(f"No OPTEE_TA key found for product: {product_code}")
     log("Creating new PKI + OPTEE_TA application keypair")
 
-    pki = create_pki(pki_base, pki_token, product_code)
+    pki = create_pki(pki_base, pki_token, product_code, tls_verify)
     pki_id = pki["pki_id"]
     log(f"Created PKI: {pki_id}")
 
@@ -238,6 +289,7 @@ def setup_or_reuse_optee_key(
         token=pki_token,
         pki_id=pki_id,
         label=f"OPTEE_TA_{product_code}",
+        tls_verify=tls_verify,
     )
     key_id = key["keypair_id"]
     log(f"Created OPTEE_TA keypair: {key_id}")
@@ -280,6 +332,7 @@ def hsm_sign(
     hsm_token: str,
     key_id: str,
     data_to_sign: bytes,
+    tls_verify: Union[bool, str],
 ) -> bytes:
     """
     HSM flow matching PKCS#11 bridge:
@@ -289,104 +342,231 @@ def hsm_sign(
       4. GET  /context/{id}/ds/creator/data/base64
     """
 
-    r = requests.post(
-        f"{hsm_base}/context",
-        json={},
-        headers=_hsm_json_headers(hsm_token),
-        verify=False,
-    )
-    r.raise_for_status()
-
-    resp = r.json()
-    ctx_id = resp.get("contextId") or resp.get("id")
-    if not ctx_id:
-        raise RuntimeError(f"/context: missing contextId/id in response: {resp}")
-
-    log(f"HSM context: {ctx_id}")
-
-    r = requests.post(
-        f"{hsm_base}/context/{ctx_id}/data",
-        data=data_to_sign,
-        headers=_hsm_raw_headers(hsm_token),
-        verify=False,
-    )
-    r.raise_for_status()
-
-    body = {
-        "publicKeyId": key_id,
-        "signatureParameters": DEFAULT_SIG_ALG,
-        "signatureFormat": "RAW",
-    }
-
-    r = requests.post(
-        f"{hsm_base}/context/{ctx_id}/ds/creator",
-        json=body,
-        headers=_hsm_json_headers(hsm_token),
-        verify=False,
-    )
-    r.raise_for_status()
-
-    r = requests.get(
-        f"{hsm_base}/context/{ctx_id}/ds/creator/data/base64",
-        headers=_hsm_auth_headers(hsm_token),
-        verify=False,
-    )
-    r.raise_for_status()
-
-    text = r.text.strip()
+    ctx_id = None
 
     try:
-        obj = r.json()
-        b64 = obj.get("Base64Data") or obj.get("base64Data") or obj.get("data")
-        if not b64:
+        r = requests.post(
+            f"{hsm_base}/context",
+            json={},
+            headers=_hsm_json_headers(hsm_token),
+            verify=tls_verify,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        resp = r.json()
+        ctx_id = resp.get("contextId") or resp.get("id")
+        if not ctx_id:
+            raise RuntimeError(f"/context: missing contextId/id in response: {resp}")
+
+        log(f"HSM context: {ctx_id}")
+
+        r = requests.post(
+            f"{hsm_base}/context/{ctx_id}/data",
+            data=data_to_sign,
+            headers=_hsm_raw_headers(hsm_token),
+            verify=tls_verify,
+            timeout=DATA_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        body = {
+            "publicKeyId": key_id,
+            "signatureParameters": DEFAULT_SIG_ALG,
+            "signatureFormat": "RAW",
+        }
+
+        r = requests.post(
+            f"{hsm_base}/context/{ctx_id}/ds/creator",
+            json=body,
+            headers=_hsm_json_headers(hsm_token),
+            verify=tls_verify,
+            timeout=DATA_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        r = requests.get(
+            f"{hsm_base}/context/{ctx_id}/ds/creator/data/base64",
+            headers=_hsm_auth_headers(hsm_token),
+            verify=tls_verify,
+            timeout=DATA_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        text = r.text.strip()
+
+        try:
+            obj = r.json()
+            b64 = (
+                obj.get("Base64Data")
+                or obj.get("base64Data")
+                or obj.get("data")
+            )
+            if not b64:
+                b64 = text
+        except (ValueError, TypeError):
             b64 = text
-    except Exception:
-        b64 = text
 
-    b64 = "".join(str(b64).split())
-    sig = base64.b64decode(b64)
+        try:
+            sig = base64.b64decode(
+                "".join(str(b64).split()),
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as exc:
+            raise RuntimeError("HSM returned invalid base64 signature data") from exc
 
-    if not sig:
-        raise RuntimeError("HSM returned empty signature")
+        if not sig:
+            raise RuntimeError("HSM returned empty signature")
 
-    log(f"HSM signature size: {len(sig)} bytes", "OK")
-    return sig
+        log(f"HSM signature size: {len(sig)} bytes", "OK")
+        return sig
+
+    finally:
+        if ctx_id:
+            try:
+                r = requests.delete(
+                    f"{hsm_base}/context/{ctx_id}",
+                    headers=_hsm_auth_headers(hsm_token),
+                    verify=tls_verify,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                r.raise_for_status()
+            except requests.RequestException as exc:
+                log(f"Could not delete HSM context {ctx_id}: {exc}", "WARN")
 
 
 # ── OP-TEE TA packaging ────────────────────────────────────────────────────────
 
-def build_signed_ta(unsigned_elf: bytes, signature: bytes) -> bytes:
-    """
-    OP-TEE signed TA layout:
+def signature_size_for_key(key_cfg: dict, override: int = None) -> int:
+    if override is not None:
+        if not 1 <= override <= 0xFFFF:
+            raise ValueError("--signature-size must be between 1 and 65535")
+        return override
 
-      struct shdr {
-          uint32_t magic;
-          uint32_t img_type;
-          uint32_t img_size;
-          uint32_t algo;
-          uint16_t hash_size;
-          uint16_t sig_size;
-      }
+    algorithm = str(key_cfg.get("algorithm", DEFAULT_APP_KEY_ALG))
+    match = re.fullmatch(r"RSA[_-]?(\d+)", algorithm, re.IGNORECASE)
+    if not match:
+        raise RuntimeError(
+            f"Cannot infer RSA signature size from key algorithm {algorithm!r}; "
+            "use --signature-size"
+        )
 
-      followed by:
-        hash
-        signature
-        ELF payload
-    """
+    bits = int(match.group(1))
+    if bits % 8:
+        raise RuntimeError(f"Invalid RSA key size in algorithm {algorithm!r}")
+    return bits // 8
 
-    digest = hashlib.sha256(unsigned_elf).digest()
+
+def build_bootstrap_ta_parts(
+    unsigned_elf: bytes,
+    ta_uuid: str,
+    ta_version: int,
+    signature_size: int,
+) -> Dict[str, bytes]:
+    """Build the exact fields hashed by OP-TEE's sign_encrypt.py."""
+    if not 0 <= ta_version <= 0xFFFFFFFF:
+        raise ValueError("--ta-version must be an unsigned 32-bit integer")
+    if not 1 <= signature_size <= 0xFFFF:
+        raise ValueError("Signature size must fit the OP-TEE uint16_t field")
 
     shdr = struct.pack(
         "<IIIIHH",
         SHDR_MAGIC,
-        SHDR_TA,
+        SHDR_BOOTSTRAP_TA,
         len(unsigned_elf),
         TEE_ALG_RSASSA_PKCS1_V1_5_SHA256,
-        len(digest),
-        len(signature),
+        HASH_SIZE,
+        signature_size,
+    )
+    uuid_bytes = uuid.UUID(ta_uuid).bytes
+    version_bytes = struct.pack("<I", ta_version)
+    signing_preimage = shdr + uuid_bytes + version_bytes + unsigned_elf
+    digest = hashlib.sha256(signing_preimage).digest()
+
+    return {
+        "shdr": shdr,
+        "uuid": uuid_bytes,
+        "version": version_bytes,
+        "image": unsigned_elf,
+        "signing_preimage": signing_preimage,
+        "digest": digest,
+    }
+
+
+def build_signed_ta(parts: Dict[str, bytes], signature: bytes) -> bytes:
+    """Stitch an OP-TEE bootstrap TA in the official field order."""
+    expected_size = struct.unpack("<IIIIHH", parts["shdr"])[5]
+    if len(signature) != expected_size:
+        raise RuntimeError(
+            f"HSM returned a {len(signature)}-byte signature, but the OP-TEE "
+            f"header was built for {expected_size} bytes"
+        )
+
+    return (
+        parts["shdr"]
+        + parts["digest"]
+        + signature
+        + parts["uuid"]
+        + parts["version"]
+        + parts["image"]
     )
 
-    return shdr + digest + signature + unsigned_elf
+
+def inspect_bootstrap_ta(signed_ta: bytes) -> Dict[str, Any]:
+    """Validate the package structure and embedded digest before writing it."""
+    minimum_size = SHDR_SIZE + HASH_SIZE + BOOTSTRAP_HEADER_SIZE
+    if len(signed_ta) < minimum_size:
+        raise RuntimeError("Generated TA is shorter than its required headers")
+
+    fields = struct.unpack("<IIIIHH", signed_ta[:SHDR_SIZE])
+    magic, image_type, image_size, algorithm, hash_size, signature_size = fields
+
+    if magic != SHDR_MAGIC:
+        raise RuntimeError(f"Generated TA has invalid magic {magic:#x}")
+    if image_type != SHDR_BOOTSTRAP_TA:
+        raise RuntimeError(f"Generated TA has invalid image type {image_type}")
+    if algorithm != TEE_ALG_RSASSA_PKCS1_V1_5_SHA256:
+        raise RuntimeError(f"Generated TA has invalid algorithm {algorithm:#x}")
+    if hash_size != HASH_SIZE:
+        raise RuntimeError(f"Generated TA has invalid hash size {hash_size}")
+
+    digest_offset = SHDR_SIZE
+    signature_offset = digest_offset + hash_size
+    bootstrap_offset = signature_offset + signature_size
+    image_offset = bootstrap_offset + BOOTSTRAP_HEADER_SIZE
+    expected_total = image_offset + image_size
+    if len(signed_ta) != expected_total:
+        raise RuntimeError(
+            f"Generated TA size is {len(signed_ta)}, expected {expected_total}"
+        )
+
+    embedded_digest = signed_ta[digest_offset:signature_offset]
+    digest_preimage = (
+        signed_ta[:SHDR_SIZE]
+        + signed_ta[bootstrap_offset:bootstrap_offset + BOOTSTRAP_HEADER_SIZE]
+        + signed_ta[image_offset:]
+    )
+    calculated_digest = hashlib.sha256(digest_preimage).digest()
+    if embedded_digest != calculated_digest:
+        raise RuntimeError("Generated TA embedded digest does not match its content")
+
+    ta_uuid = str(
+        uuid.UUID(bytes=signed_ta[bootstrap_offset:bootstrap_offset + 16])
+    )
+    ta_version = struct.unpack(
+        "<I", signed_ta[bootstrap_offset + 16:image_offset]
+    )[0]
+    return {
+        "magic": magic,
+        "image_type": image_type,
+        "image_size": image_size,
+        "algorithm": algorithm,
+        "hash_size": hash_size,
+        "signature_size": signature_size,
+        "digest": embedded_digest,
+        "ta_uuid": ta_uuid,
+        "ta_version": ta_version,
+    }
 
 
 def write_outputs(
@@ -398,6 +578,9 @@ def write_outputs(
     signature: bytes,
     signed_ta: bytes,
     key_cfg: dict,
+    ta_info: Dict[str, Any],
+    sign_mode: str,
+    certificate_pem: str,
 ) -> None:
     product_dir = out_dir / product_code
     product_dir.mkdir(parents=True, exist_ok=True)
@@ -411,6 +594,9 @@ def write_outputs(
     checksum_path = product_dir / f"{ta_name}.sha256"
     checksum_path.write_text(f"{ta_sha}  {ta_name}\n")
 
+    certificate_path = product_dir / "optee_ta_public_certificate.pem"
+    certificate_path.write_text(certificate_pem, encoding="ascii")
+
     manifest = {
         "product_code": product_code,
         "ta_uuid": ta_uuid,
@@ -422,12 +608,14 @@ def write_outputs(
         "output_size_bytes": len(signed_ta),
         "optee_header": {
             "magic": hex(SHDR_MAGIC),
-            "img_type": SHDR_TA,
+            "img_type": SHDR_BOOTSTRAP_TA,
             "img_size": len(unsigned_elf),
             "algo": hex(TEE_ALG_RSASSA_PKCS1_V1_5_SHA256),
             "hash_algorithm": "SHA256",
             "hash_size": HASH_SIZE,
             "signature_size": len(signature),
+            "ta_version": ta_info["ta_version"],
+            "signed_digest_sha256": ta_info["digest"].hex(),
         },
         "signing": {
             "pki_id": key_cfg["pki_id"],
@@ -436,9 +624,19 @@ def write_outputs(
             "key_algorithm": key_cfg.get("algorithm", DEFAULT_APP_KEY_ALG),
             "signature_algorithm": key_cfg.get("signature_algorithm", DEFAULT_SIG_ALG),
             "signature_format": "RAW",
+            "signature_sha256": sha256_bytes(signature),
+            "hsm_input_mode": sign_mode,
+            "public_certificate_file": str(certificate_path),
+            "public_certificate_sha256": sha256_bytes(
+                certificate_pem.encode("ascii")
+            ),
         },
         "created_at": now_utc(),
         "install_hint": f"copy {ta_name} to /lib/optee_armtz/{ta_name}",
+        "public_key_hint": (
+            "openssl x509 -in optee_ta_public_certificate.pem -pubkey "
+            "-noout > optee_ta_public_key.pem"
+        ),
     }
 
     manifest_path = product_dir / "optee_signing_manifest.json"
@@ -447,6 +645,7 @@ def write_outputs(
 
     log(f"Signed TA: {ta_path}", "OK")
     log(f"Checksum:  {checksum_path}", "OK")
+    log(f"Certificate: {certificate_path}", "OK")
     log(f"Manifest:  {manifest_path}", "OK")
 
 
@@ -463,12 +662,44 @@ def parse_args():
     p.add_argument("--key-map", default="optee_key_map.json")
     p.add_argument("--no-create-key", action="store_true")
     p.add_argument("--out-dir", default="remote-optee/results")
+    p.add_argument(
+        "--ta-version",
+        type=lambda value: int(value, 0),
+        default=0,
+        help="Unsigned 32-bit TA rollback-protection version (default: 0)",
+    )
+    p.add_argument(
+        "--signature-size",
+        type=int,
+        help="RSA signature size in bytes; inferred from the key map by default",
+    )
+    p.add_argument(
+        "--sign-mode",
+        choices=["hsm-message", "optee-digest"],
+        default="hsm-message",
+        help=(
+            "hsm-message uploads the OP-TEE digest preimage for SHA256WITHRSA; "
+            "optee-digest uploads the 32-byte digest for an API known to accept "
+            "prehashed input"
+        ),
+    )
 
     # Match HAB script env names
     p.add_argument("--hsm-base", default=os.environ.get("HSM_BASE", ""))
     p.add_argument("--hsm-token", default=os.environ.get("HSM_AUTH_TOKEN", ""))
     p.add_argument("--pki-base", default=os.environ.get("PKI_BASE", ""))
     p.add_argument("--pki-token", default=os.environ.get("PKI_AUTH_TOKEN", ""))
+    tls = p.add_mutually_exclusive_group()
+    tls.add_argument(
+        "--ca-bundle",
+        default=os.environ.get("REQUESTS_CA_BUNDLE"),
+        help="CA bundle used to verify PKI/HSM HTTPS certificates",
+    )
+    tls.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable PKI/HSM TLS certificate verification",
+    )
 
     return p.parse_args()
 
@@ -491,6 +722,10 @@ def main():
 
     if not args.hsm_token:
         sys.exit("--hsm-token is required or set HSM_AUTH_TOKEN")
+    if not 0 <= args.ta_version <= 0xFFFFFFFF:
+        sys.exit("--ta-version must be an unsigned 32-bit integer")
+
+    tls_verify = False if args.insecure else (args.ca_bundle or True)
 
     input_path = Path(args.input)
     if not input_path.is_file():
@@ -511,16 +746,45 @@ def main():
         product_code=args.product_code,
         key_map_path=Path(args.key_map),
         create_if_missing=not args.no_create_key,
+        tls_verify=tls_verify,
     )
+
+    certificate_pem = export_certificate(
+        pki_base=args.pki_base.rstrip("/"),
+        token=pki_token,
+        keypair_id=key_cfg["optee_ta_key_id"],
+        tls_verify=tls_verify,
+    )
+
+    signature_size = signature_size_for_key(key_cfg, args.signature_size)
+    parts = build_bootstrap_ta_parts(
+        unsigned_elf=unsigned_elf,
+        ta_uuid=args.uuid,
+        ta_version=args.ta_version,
+        signature_size=signature_size,
+    )
+
+    if args.sign_mode == "hsm-message":
+        data_to_sign = parts["signing_preimage"]
+        log("HSM will SHA-256 the OP-TEE signed-data preimage")
+    else:
+        data_to_sign = parts["digest"]
+        log(
+            "Uploading a precomputed digest; use only if the HSM API does not "
+            "hash SHA256WITHRSA input",
+            "WARN",
+        )
 
     signature = hsm_sign(
         hsm_base=args.hsm_base.rstrip("/"),
         hsm_token=args.hsm_token,
         key_id=key_cfg["optee_ta_key_id"],
-        data_to_sign=unsigned_elf,
+        data_to_sign=data_to_sign,
+        tls_verify=tls_verify,
     )
 
-    signed_ta = build_signed_ta(unsigned_elf, signature)
+    signed_ta = build_signed_ta(parts, signature)
+    ta_info = inspect_bootstrap_ta(signed_ta)
 
     write_outputs(
         out_dir=Path(args.out_dir),
@@ -531,6 +795,9 @@ def main():
         signature=signature,
         signed_ta=signed_ta,
         key_cfg=key_cfg,
+        ta_info=ta_info,
+        sign_mode=args.sign_mode,
+        certificate_pem=certificate_pem,
     )
 
 
